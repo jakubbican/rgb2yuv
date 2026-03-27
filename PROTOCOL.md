@@ -235,6 +235,29 @@ Chroma odchylky jsou na ostrých barevných přechodech, kde box filter (náš) 
 
 ---
 
+## 8b. External review (Gemini)
+
+Po dokončení implementace jsme nechali kód zrecenzovat externím AI modelem (Google Gemini).
+
+### Validní nalezení — opraveno:
+
+1. **Pointer arithmetic overflow** (kritické) — `row * rgb_stride` s oběma `int` může přetéct pro velké obrázky (height=200k, stride=15k → 3G > INT32_MAX). Opraveno: cast na `(ptrdiff_t)row * stride` ve všech 3 konverzních funkcích.
+
+2. **Koeficienty nemusí zůstat v registrech** — `coeffs` pointer není `restrict`, compiler nemůže vyloučit alias s výstupními buffery → potenciální reload z paměti v každé iteraci. Opraveno: lokální kopie koeficientů do stack proměnných v `rgb2yuv_444`.
+
+### Validní postřehy — zdokumentováno jako future work:
+
+3. **RGBA/BGRA vstup** — reálný svět je 32-bit RGBA. `rgb_pixel_stride` parametr nebo dedicované entry points.
+4. **NV21 podpora** — Android HAL default. Trivální swap U↔V v zápisu.
+5. **Odstranění libm** — precomputed `static const` tabulky místo runtime `round()`.
+6. **8-bit vs 16-bit benchmark** — srovnání je Y-only vs full YCbCr, ne fair comparison.
+
+### Kde se Gemini mýlil:
+
+7. **"Implementation-defined right shift on negative"** — Gemini tvrdil, že `(cbr*R + cbg*G + cbb*B + c_add) >> 16` může mít záporný operand. Ale díky foldování `128*SCALE+HALF` do `c_add` je minimum `= -cbb*255 + c_add = -32768*255 + 8421376 = 65536 > 0`. Vždy kladné — by design.
+
+---
+
 ## 9. Otevřené otázky a možnosti rozšíření
 
 ### SIMD optimalizace

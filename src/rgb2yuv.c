@@ -6,8 +6,8 @@
  */
 
 #include "rgb2yuv.h"
-#include <math.h>   /* round() - used only in rgb2yuv_init, not in hot path */
-#include <stddef.h> /* NULL */
+#include <math.h>    /* round() - used only in rgb2yuv_init, not in hot path */
+#include <stddef.h>  /* NULL, ptrdiff_t */
 
 /* ------------------------------------------------------------------------ */
 /*  Constants                                                               */
@@ -148,6 +148,11 @@ void rgb2yuv_init(rgb2yuv_coeffs *coeffs,
      * For CbCr: c_add = 128 * SCALE + HALF
      *           The +128 offset shifts [-128,127] → [0,255].
      *           HALF provides round-half-up for the >> SHIFT.
+     *
+     * NOTE on signed right-shift: By folding 128*SCALE into c_add, the
+     * accumulator (cbr*R + cbg*G + cbb*B + c_add) is guaranteed non-negative:
+     *   min = -cbb*255 + c_add = -32768*255 + 8421376 = 65536 > 0
+     * This avoids implementation-defined behavior of >> on negative values.
      */
     int32_t y_bias = (range == RGB2YUV_RANGE_STUDIO) ? 16 : 0;
     coeffs->y_add = y_bias * SCALE + HALF;
@@ -182,11 +187,18 @@ int rgb2yuv_444(const rgb2yuv_coeffs *coeffs,
     if (u_stride < width || v_stride < width)
         return RGB2YUV_ERR_STRIDE;
 
+    /* Load coefficients into locals to guarantee they stay in registers
+     * (compiler can't assume coeffs doesn't alias output planes). */
+    const int32_t l_yr = coeffs->yr, l_yg = coeffs->yg, l_yb = coeffs->yb;
+    const int32_t l_cbr = coeffs->cbr, l_cbg = coeffs->cbg, l_cbb = coeffs->cbb;
+    const int32_t l_crr = coeffs->crr, l_crg = coeffs->crg, l_crb = coeffs->crb;
+    const int32_t l_ya = coeffs->y_add, l_ca = coeffs->c_add;
+
     for (int row = 0; row < height; row++) {
-        const uint8_t * restrict src = rgb + row * rgb_stride;
-        uint8_t * restrict yp = y + row * y_stride;
-        uint8_t * restrict up = u + row * u_stride;
-        uint8_t * restrict vp = v + row * v_stride;
+        const uint8_t * restrict src = rgb + (ptrdiff_t)row * rgb_stride;
+        uint8_t * restrict yp = y + (ptrdiff_t)row * y_stride;
+        uint8_t * restrict up = u + (ptrdiff_t)row * u_stride;
+        uint8_t * restrict vp = v + (ptrdiff_t)row * v_stride;
 
         for (int col = 0; col < width; col++) {
             int32_t r = src[0];
@@ -194,9 +206,9 @@ int rgb2yuv_444(const rgb2yuv_coeffs *coeffs,
             int32_t b = src[2];
             src += 3;
 
-            yp[col] = compute_y(coeffs, r, g, b);
-            up[col] = compute_cb(coeffs, r, g, b);
-            vp[col] = compute_cr(coeffs, r, g, b);
+            yp[col] = (uint8_t)((l_yr*r + l_yg*g + l_yb*b + l_ya) >> SHIFT);
+            up[col] = clamp_u8((l_cbr*r + l_cbg*g + l_cbb*b + l_ca) >> SHIFT);
+            vp[col] = clamp_u8((l_crr*r + l_crg*g + l_crb*b + l_ca) >> SHIFT);
         }
     }
     return RGB2YUV_OK;
@@ -243,12 +255,12 @@ int rgb2yuv_i420(const rgb2yuv_coeffs *coeffs,
 
     /* Process pairs of rows */
     for (int row = 0; row < even_h; row += 2) {
-        const uint8_t * restrict src0 = rgb + row * rgb_stride;
-        const uint8_t * restrict src1 = rgb + (row + 1) * rgb_stride;
-        uint8_t * restrict yp0 = y + row * y_stride;
-        uint8_t * restrict yp1 = y + (row + 1) * y_stride;
-        uint8_t * restrict up  = u + (row / 2) * u_stride;
-        uint8_t * restrict vp  = v + (row / 2) * v_stride;
+        const uint8_t * restrict src0 = rgb + (ptrdiff_t)row * rgb_stride;
+        const uint8_t * restrict src1 = rgb + (ptrdiff_t)(row + 1) * rgb_stride;
+        uint8_t * restrict yp0 = y + (ptrdiff_t)row * y_stride;
+        uint8_t * restrict yp1 = y + (ptrdiff_t)(row + 1) * y_stride;
+        uint8_t * restrict up  = u + (ptrdiff_t)(row / 2) * u_stride;
+        uint8_t * restrict vp  = v + (ptrdiff_t)(row / 2) * v_stride;
 
         int cx = 0;
 
@@ -301,10 +313,10 @@ int rgb2yuv_i420(const rgb2yuv_coeffs *coeffs,
     /* Odd last row: 1x2 blocks (and possibly 1x1 corner) */
     if (height & 1) {
         int last_row = even_h;
-        const uint8_t * restrict src0 = rgb + last_row * rgb_stride;
-        uint8_t * restrict yp0 = y + last_row * y_stride;
-        uint8_t * restrict up  = u + (last_row / 2) * u_stride;
-        uint8_t * restrict vp  = v + (last_row / 2) * v_stride;
+        const uint8_t * restrict src0 = rgb + (ptrdiff_t)last_row * rgb_stride;
+        uint8_t * restrict yp0 = y + (ptrdiff_t)last_row * y_stride;
+        uint8_t * restrict up  = u + (ptrdiff_t)(last_row / 2) * u_stride;
+        uint8_t * restrict vp  = v + (ptrdiff_t)(last_row / 2) * v_stride;
 
         int cx = 0;
 
@@ -361,11 +373,11 @@ int rgb2yuv_nv12(const rgb2yuv_coeffs *coeffs,
     int even_h = height & ~1;
 
     for (int row = 0; row < even_h; row += 2) {
-        const uint8_t * restrict src0 = rgb + row * rgb_stride;
-        const uint8_t * restrict src1 = rgb + (row + 1) * rgb_stride;
-        uint8_t * restrict yp0  = y  + row * y_stride;
-        uint8_t * restrict yp1  = y  + (row + 1) * y_stride;
-        uint8_t * restrict uvp  = uv + (row / 2) * uv_stride;
+        const uint8_t * restrict src0 = rgb + (ptrdiff_t)row * rgb_stride;
+        const uint8_t * restrict src1 = rgb + (ptrdiff_t)(row + 1) * rgb_stride;
+        uint8_t * restrict yp0  = y  + (ptrdiff_t)row * y_stride;
+        uint8_t * restrict yp1  = y  + (ptrdiff_t)(row + 1) * y_stride;
+        uint8_t * restrict uvp  = uv + (ptrdiff_t)(row / 2) * uv_stride;
 
         int cx = 0;
 
@@ -412,9 +424,9 @@ int rgb2yuv_nv12(const rgb2yuv_coeffs *coeffs,
 
     if (height & 1) {
         int last_row = even_h;
-        const uint8_t * restrict src0 = rgb + last_row * rgb_stride;
-        uint8_t * restrict yp0 = y  + last_row * y_stride;
-        uint8_t * restrict uvp = uv + (last_row / 2) * uv_stride;
+        const uint8_t * restrict src0 = rgb + (ptrdiff_t)last_row * rgb_stride;
+        uint8_t * restrict yp0 = y  + (ptrdiff_t)last_row * y_stride;
+        uint8_t * restrict uvp = uv + (ptrdiff_t)(last_row / 2) * uv_stride;
 
         int cx = 0;
 
